@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GLaDOS自动签到
 // @namespace    https://github.com/Walvez/glados-auto-checkin
-// @version      1.7.0
+// @version      1.8.0
 // @description  在脚本猫后台为不同主站域名中的账号逐一签到；无需复制 Cookie，也无需保持网页打开。
 // @author       Walvez
 // @icon         https://glados.network/favicon.ico
@@ -61,6 +61,35 @@ const NOTIFY_KEYS = {
   pushme: "glados_notify_pushme",
   bark: "glados_notify_bark",
 };
+const EXCHANGE_PLAN_KEY = "glados_exchange_plan";
+const EXCHANGE_PLANS = Object.freeze({
+  plan100: Object.freeze({ points: 100, days: 10, label: "100 积分兑换 10 天" }),
+  plan200: Object.freeze({ points: 200, days: 30, label: "200 积分兑换 30 天" }),
+  plan500: Object.freeze({ points: 500, days: 100, label: "500 积分兑换 100 天" }),
+});
+
+function resolveExchangePlan(strategy, balance) {
+  const norm = String(strategy === undefined ? "max" : strategy || "").trim().toLowerCase();
+  if (!norm || norm === "off" || norm === "none" || norm === "false" || norm === "0") return null;
+  const num = Number(balance);
+  if (!Number.isFinite(num)) return null;
+
+  if (norm === "max") {
+    if (num >= 500) return "plan500";
+    return null;
+  }
+  if (norm === "auto") {
+    if (num >= 500) return "plan500";
+    if (num >= 200) return "plan200";
+    if (num >= 100) return "plan100";
+    return null;
+  }
+  const target = EXCHANGE_PLANS[norm];
+  if (target && num >= target.points) {
+    return norm;
+  }
+  return null;
+}
 
 function log(message, level = "info") {
   GM_log(`[GLaDOS] ${message}`, level);
@@ -359,6 +388,28 @@ function registerNotificationMenus() {
     const value = ask("输入 Bark Key 或完整推送 URL；留空并确定可关闭该通知：");
     if (value !== null) await GM_setValue(NOTIFY_KEYS.bark, value.trim());
   });
+  GM_registerMenuCommand("配置积分自动兑换策略", async () => {
+    const rawVal = typeof GM_getValue === "function" ? await GM_getValue(EXCHANGE_PLAN_KEY, "max") : "max";
+    const current = rawVal === "" || rawVal === "off" ? "关闭" : rawVal;
+    const value = ask(
+      `当前策略：${current}\n输入兑换策略：max（默认，500积分兑100天，小于500跳过）/ auto（梯级匹配）/ plan100 / plan200 / plan500；输入 off 可关闭：`
+    );
+    if (value !== null) {
+      const trimmed = value.trim().toLowerCase();
+      if (!trimmed || trimmed === "off" || trimmed === "none") {
+        await GM_setValue(EXCHANGE_PLAN_KEY, "off");
+        GM_notification({ title: "GLaDOS", text: "已关闭自动积分兑换" });
+      } else if (["auto", "max", "plan100", "plan200", "plan500"].includes(trimmed)) {
+        await GM_setValue(EXCHANGE_PLAN_KEY, trimmed);
+        GM_notification({ title: "GLaDOS", text: `已设置积分兑换策略：${trimmed}` });
+      } else {
+        GM_notification({
+          title: "GLaDOS",
+          text: `不支持的策略：${value}，可选：max, auto, plan100, plan200, plan500, off`,
+        });
+      }
+    }
+  });
   GM_registerMenuCommand("测试远程通知", async () => {
     const result = await sendRemoteNotifications(
       "GLaDOS 通知测试",
@@ -393,6 +444,38 @@ async function requestWithRetry(options) {
   }
 
   throw lastError;
+}
+
+async function executeExchange(origin, strategy, currentBalance) {
+  const targetPlan = resolveExchangePlan(strategy, currentBalance);
+  if (!targetPlan) return null;
+
+  const planMeta = EXCHANGE_PLANS[targetPlan];
+  log(`触发自动兑换：${planMeta.label}（当前 ${currentBalance} 积分）`);
+  try {
+    // 兑换为非幂等请求，使用单次 request()，绝不重试
+    const res = await request({
+      method: "POST",
+      url: `${origin}/api/user/exchange`,
+      headers: {
+        Accept: "application/json, text/plain, */*",
+        Origin: origin,
+        Referer: `${origin}/console/checkin`,
+        "Content-Type": "application/json;charset=UTF-8",
+      },
+      data: JSON.stringify({ planType: targetPlan }),
+    });
+
+    if (res && res.code === 0) {
+      log(`积分兑换成功：+${planMeta.days}天`);
+      return { ok: true, days: planMeta.days, points: planMeta.points, label: planMeta.label };
+    }
+    log(`积分兑换未成功：${(res && res.message) || "接口返回异常"}`, "warn");
+    return { ok: false, message: (res && res.message) || "接口返回异常" };
+  } catch (error) {
+    log(`积分兑换请求异常：${error.message}`, "warn");
+    return { ok: false, message: error.message };
+  }
 }
 
 /**
@@ -707,9 +790,21 @@ async function checkinSession({ origin, status }) {
     }
   }
 
+  let exchangeText = "";
+  let exchangeResult = undefined;
+  const exchangeStrategy =
+    typeof GM_getValue === "function" ? (await GM_getValue(EXCHANGE_PLAN_KEY, "max")) : "max";
+  if (exchangeStrategy && livePoints !== undefined) {
+    const exchangeRes = await executeExchange(origin, exchangeStrategy, livePoints);
+    if (exchangeRes && exchangeRes.ok) {
+      exchangeResult = exchangeRes;
+      exchangeText = `\n🎁 成功兑换 ${exchangeRes.days} 天会员（消耗 ${exchangeRes.points} 积分）`;
+    }
+  }
+
   const remaining = Number.parseInt(status.data.leftDays, 10);
   const remainingText = Number.isFinite(remaining) ? `\n剩余${remaining}天` : "";
-  const message = checkin.message;
+  const message = `${checkin.message}${exchangeText}`;
 
   log(`${account}：${message}${remainingText.replace("\n", "，")}`);
   return {
@@ -722,6 +817,7 @@ async function checkinSession({ origin, status }) {
     remainingDays: Number.isFinite(remaining) ? remaining : undefined,
     remainingText,
     origin,
+    exchangeText: exchangeResult ? `已兑+${exchangeResult.days}天` : undefined,
   };
 }
 
@@ -731,7 +827,8 @@ function resultLine(result) {
   const earned = result.earnedPoints === undefined ? "+?" : `+${result.earnedPoints}`;
   const total = result.totalPoints === undefined ? "?积分" : `${result.totalPoints}积分`;
   const days = result.remainingDays === undefined ? "?天" : `${result.remainingDays}天`;
-  return `${domain}: ${result.compactAccount}, ${status}, ${earned}; ${total}, ${days}.`;
+  const exchange = result.exchangeText ? `, ${result.exchangeText}` : "";
+  return `${domain}: ${result.compactAccount}, ${status}, ${earned}; ${total}, ${days}${exchange}.`;
 }
 
 async function run() {

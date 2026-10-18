@@ -31,6 +31,11 @@ const {
   redactSecrets,
   buildCheckinHeaders,
   buildStatusHeaders,
+  buildExchangeHeaders,
+  EXCHANGE_PLANS,
+  DEFAULT_EXCHANGE_PLAN,
+  normalizeExchangePlanName,
+  resolveExchangePlan,
   maskEmail,
   isSuccessfulOutcome,
 } = core;
@@ -55,10 +60,11 @@ function createRequester(fetchImpl, options = {}) {
   const timeoutMs = options.timeoutMs || REQUEST_TIMEOUT_MS;
   const sleep = options.sleep || defaultSleep;
 
-  return async function request(method, url, init = {}) {
+  return async function request(method, url, init = {}, requestOptions = {}) {
     let lastError;
+    const maxAttempts = requestOptions.noRetry ? 1 : MAX_REQUEST_ATTEMPTS;
 
-    for (let attempt = 1; attempt <= MAX_REQUEST_ATTEMPTS; attempt += 1) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       const controller = typeof AbortController === "function" ? new AbortController() : null;
       const timer =
         controller && timeoutMs > 0
@@ -101,7 +107,7 @@ function createRequester(fetchImpl, options = {}) {
           );
         }
 
-        if (attempt < MAX_REQUEST_ATTEMPTS && shouldRetry(lastError)) {
+        if (attempt < maxAttempts && shouldRetry(lastError)) {
           await sleep(RETRY_DELAY_MS);
           continue;
         }
@@ -195,10 +201,65 @@ async function fetchLiveBalance(origin, account, request, logger) {
 }
 
 /**
+ * Execute points exchange for an account when an exchange plan is configured and
+ * spendable balance meets the threshold. Single attempt, never retried.
+ */
+async function executeExchange(origin, account, strategy, currentBalance, request, logger) {
+  if (currentBalance === undefined) {
+    logger.info(`[${account.name}] 未能获取实时积分，跳过自动兑换`);
+    return { ok: false, message: "⚠️ 兑换跳过（积分查询未返回）" };
+  }
+
+  const targetPlan = resolveExchangePlan(strategy, currentBalance);
+  if (!targetPlan) {
+    logger.info(
+      `[${account.name}] 积分不足或未达策略要求（当前 ${currentBalance} 积分，策略 ${strategy}），跳过兑换`
+    );
+    return null;
+  }
+
+  const planMeta = EXCHANGE_PLANS[targetPlan];
+  logger.info(`[${account.name}] 触发自动兑换：${planMeta.label}（当前 ${currentBalance} 积分）`);
+
+  try {
+    const response = await request(
+      "POST",
+      `${origin}/api/user/exchange`,
+      {
+        headers: buildExchangeHeaders(origin, account.cookie, account.authorization),
+        body: JSON.stringify({ planType: targetPlan }),
+      },
+      { noRetry: true }
+    );
+
+    const json = response.json;
+    if (json && json.code === 0) {
+      const msg = `🎁 兑换成功：+${planMeta.days}天（消耗${planMeta.points}积分）`;
+      logger.info(`[${account.name}] ${msg}`);
+      return { ok: true, message: msg };
+    }
+
+    const errMsg = (json && json.message) || "兑换未成功";
+    logger.warn(`[${account.name}] 积分兑换未成功：${errMsg}`);
+    return { ok: false, message: `⚠️ 兑换未成功（${errMsg}）` };
+  } catch (error) {
+    logger.warn(`[${account.name}] 积分兑换请求异常：${error.message || String(error)}`);
+    return { ok: false, message: `⚠️ 兑换请求异常（${error.message || "网络失败"}）` };
+  }
+}
+
+/**
  * Check in one account. Successful or already-checked outcomes are not repeated
  * within the same account object (`account._done`).
  */
-async function checkinAccount(account, request, origins, logger, secrets) {
+async function checkinAccount(
+  account,
+  request,
+  origins,
+  logger,
+  secrets,
+  defaultExchangePlan = ""
+) {
   if (account._done) {
     logger.info(`[${account.name}] 本次运行已成功/已签到，跳过重复请求`);
     return {
@@ -245,8 +306,24 @@ async function checkinAccount(account, request, origins, logger, secrets) {
     }
   }
 
+  let exchangeNotice = "";
+  const effectiveExchangePlan = account.exchange || defaultExchangePlan;
+  if (effectiveExchangePlan) {
+    const exchangeResult = await executeExchange(
+      origin,
+      account,
+      effectiveExchangePlan,
+      liveBalance,
+      request,
+      logger
+    );
+    if (exchangeResult && exchangeResult.message) {
+      exchangeNotice = `\n${exchangeResult.message}`;
+    }
+  }
+
   const remainingText = remainingDays != null ? `\n剩余${remainingDays}天` : "";
-  const summary = `${classified.message}${remainingText}\n签到域名：${new URL(origin).hostname}`;
+  const summary = `${classified.message}${remainingText}${exchangeNotice}\n签到域名：${new URL(origin).hostname}`;
 
   account._done = {
     kind: classified.kind,
@@ -318,15 +395,37 @@ async function runCheckin(options = {}) {
     return { ok: false, results: [], exitCode: 1, error: message };
   }
 
+  let defaultExchangePlan = DEFAULT_EXCHANGE_PLAN;
+  const rawExchangePlan = env.GLADOS_EXCHANGE_PLAN !== undefined ? env.GLADOS_EXCHANGE_PLAN : env.EXCHANGE_PLAN;
+  if (rawExchangePlan !== undefined) {
+    try {
+      defaultExchangePlan = normalizeExchangePlanName(rawExchangePlan, "GLADOS_EXCHANGE_PLAN");
+    } catch (error) {
+      const message = redactSecrets(error.message || String(error), secrets);
+      logger.error(message);
+      return { ok: false, results: [], exitCode: 1, error: message };
+    }
+  }
+
   const request = createRequester(fetchImpl, { sleep, timeoutMs: options.timeoutMs });
   const results = [];
   let failed = 0;
 
   logger.info(`GLaDOS 签到开始：${accounts.length} 个账号，候选域名 ${origins.length} 个`);
+  if (defaultExchangePlan) {
+    logger.info(`全局自动兑换计划已启用：${defaultExchangePlan}`);
+  }
 
   for (const account of accounts) {
     try {
-      const result = await checkinAccount(account, request, origins, logger, secrets);
+      const result = await checkinAccount(
+        account,
+        request,
+        origins,
+        logger,
+        secrets,
+        defaultExchangePlan
+      );
       results.push(result);
       if (!isSuccessfulOutcome(result.kind)) {
         failed += 1;
@@ -370,9 +469,10 @@ async function main(argv = process.argv.slice(2), options = {}) {
       "Usage: node cli/checkin.js",
       "",
       "Environment:",
-      "  GLADOS_COOKIE   Cookie secret (JSON array, newline-separated, or single cookie)",
-      "  GLADOS_COOKIES  Alias of GLADOS_COOKIE",
-      "  GLADOS_ORIGIN   Optional default origin for entries without an origin field",
+      "  GLADOS_COOKIE         Cookie secret (JSON array, newline-separated, or single cookie)",
+      "  GLADOS_COOKIES        Alias of GLADOS_COOKIE",
+      "  GLADOS_ORIGIN         Optional default origin for entries without an origin field",
+      "  GLADOS_EXCHANGE_PLAN  Exchange plan: max (default, 500 pts -> 100 days), auto, plan100, plan200, plan500, or off",
       "",
       "Exit codes: 0 success/already-checked for all accounts; 1 otherwise",
     ].join("\n");

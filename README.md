@@ -12,7 +12,7 @@
 支持 **ScriptCat · Surge · Quantumult X · GitHub Actions**，兼容 7 个 GLaDOS 主站域名：`glados.network`、`glados.rocks`、`glados.one`、`glados.space`、`glados.cloud`、`glados.vip`、`glados-facility.com`
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-2ea44f.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.7.0-blue.svg)](package.json)
+[![Version](https://img.shields.io/badge/version-1.8.0-blue.svg)](package.json)
 [![ScriptCat](https://img.shields.io/badge/ScriptCat-安装脚本-ff6b35)](https://scriptcat.org/zh-CN/script-show-page/7014)
 [![Surge](https://img.shields.io/badge/Surge-Module-5b5bd6)](Surge/glados-auto-checkin.sgmodule)
 [![Quantumult X](https://img.shields.io/badge/Quantumult%20X-Snippet-111111)](QuantumultX/glados-auto-checkin.snippet)
@@ -229,6 +229,7 @@ npm run checkin
 ```
 
 可选环境变量 `GLADOS_ORIGIN=https://glados.cloud` 可为未填写 `origin` 的账号指定默认域名；账号对象中的 `origin` 优先。
+可选环境变量 `GLADOS_EXCHANGE_PLAN` 可自定义积分自动兑换策略（默认开启 `max`：目标兑换 500 积分换 100 天最大套餐，积分小于 500 时自动跳过保留；也可设为 `auto` 梯级匹配可用档位、`plan100`、`plan200`、`plan500`，或设为 `off` 关闭）。多账号 JSON 也支持通过 `"exchange": "plan100"`（或 `"exchange": "off"`）为单个账号独立指定策略。
 
 #### 8. 通知方式
 

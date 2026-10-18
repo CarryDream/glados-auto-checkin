@@ -2,6 +2,7 @@ const COOKIE_KEY = "evil_gladoscookie";
 const AUTH_KEY = "evil_galdosauthorization";
 const ORIGIN_KEY = "evil_gladosorigin";
 const LAST_SUCCESS_KEY = "glados_last_success_date";
+const EXCHANGE_PLAN_KEY = "glados_exchange_plan";
 const DEFAULT_ORIGIN = "https://glados.rocks";
 const SUPPORTED_ORIGINS = [
   "https://glados.network",
@@ -17,6 +18,35 @@ const ORIGIN_HOST_RE =
 const SCRIPT_VERSION = "reliability-20260826-checkin-record-filter";
 const MAX_REQUEST_ATTEMPTS = 2;
 const RETRY_DELAY = 1500;
+
+const EXCHANGE_PLANS = {
+  plan100: { points: 100, days: 10, label: "100 积分兑换 10 天" },
+  plan200: { points: 200, days: 30, label: "200 积分兑换 30 天" },
+  plan500: { points: 500, days: 100, label: "500 积分兑换 100 天" },
+};
+
+function resolveExchangePlan(strategy, balance) {
+  const norm = String(strategy === undefined ? "max" : strategy || "").trim().toLowerCase();
+  if (!norm || norm === "off" || norm === "none" || norm === "false" || norm === "0") return null;
+  const num = Number(balance);
+  if (!Number.isFinite(num)) return null;
+
+  if (norm === "max") {
+    if (num >= 500) return "plan500";
+    return null;
+  }
+  if (norm === "auto") {
+    if (num >= 500) return "plan500";
+    if (num >= 200) return "plan200";
+    if (num >= 100) return "plan100";
+    return null;
+  }
+  const target = EXCHANGE_PLANS[norm];
+  if (target && num >= target.points) {
+    return norm;
+  }
+  return null;
+}
 
 let finished = false;
 
@@ -289,7 +319,7 @@ function classifyCheckin(result, liveBalance) {
   throw new Error(`签到接口返回异常${detail ? `：${detail}` : ""}`);
 }
 
-function checkStatus(origin, cookie, authorization, checkin) {
+function checkStatus(origin, cookie, authorization, checkin, exchangeNotice = "") {
   requestWithRetry(
     "GET",
     {
@@ -300,10 +330,11 @@ function checkStatus(origin, cookie, authorization, checkin) {
       },
     },
     (error, response, body) => {
+      const extraNotice = exchangeNotice ? `\n${exchangeNotice}` : "";
       if (error) {
         return finishWithNotification(
           "",
-          `${checkin.message}\n账户状态查询失败，不影响本次签到：${error.message}`,
+          `${checkin.message}\n账户状态查询失败，不影响本次签到：${error.message}${extraNotice}`,
           { status: "partial_success", version: SCRIPT_VERSION, checkinMessage: checkin.message }
         );
       }
@@ -314,7 +345,7 @@ function checkStatus(origin, cookie, authorization, checkin) {
       } catch (parseError) {
         return finishWithNotification(
           "",
-          `${checkin.message}\n账户状态查询失败，不影响本次签到：${parseError.message}`,
+          `${checkin.message}\n账户状态查询失败，不影响本次签到：${parseError.message}${extraNotice}`,
           { status: "partial_success", version: SCRIPT_VERSION, checkinMessage: checkin.message }
         );
       }
@@ -323,7 +354,7 @@ function checkStatus(origin, cookie, authorization, checkin) {
         const detail = status.message ? `：${status.message}` : "";
         return finishWithNotification(
           "",
-          `${checkin.message}\n账户状态查询失败，不影响本次签到${detail}`,
+          `${checkin.message}\n账户状态查询失败，不影响本次签到${detail}${extraNotice}`,
           { status: "partial_success", version: SCRIPT_VERSION, checkinMessage: checkin.message }
         );
       }
@@ -333,7 +364,7 @@ function checkStatus(origin, cookie, authorization, checkin) {
       const remainingText = Number.isFinite(remaining) ? `\n剩余${remaining}天` : "";
       finishWithNotification(
         `账户：${account}`,
-        `${checkin.message}${remainingText}`,
+        `${checkin.message}${remainingText}${extraNotice}`,
         {
           status: checkin.kind === "already_checked" ? "already_checked" : "ok",
           version: SCRIPT_VERSION,
@@ -375,6 +406,46 @@ function fetchLiveBalance(origin, cookie, authorization, callback) {
         // 忽略，沿用签到记录余额。
       }
       callback(undefined);
+    }
+  );
+}
+
+function executeExchange(origin, cookie, authorization, planKey, callback) {
+  if (!planKey) return callback(null);
+  const planMeta = EXCHANGE_PLANS[planKey];
+
+  // 严格单次请求，绝不重试非幂等兑换
+  rawRequest(
+    "POST",
+    {
+      url: `${origin}/api/user/exchange`,
+      headers: {
+        Accept: "application/json, text/plain, */*",
+        Origin: origin,
+        Referer: `${origin}/console/checkin`,
+        Cookie: cookie || "",
+        Authorization: authorization || "",
+        "Content-Type": "application/json;charset=utf-8",
+      },
+      body: JSON.stringify({ planType: planKey }),
+    },
+    (error, response, body) => {
+      if (error) {
+        return callback({ ok: false, message: `⚠️ 兑换网络请求失败：${error.message || String(error)}` });
+      }
+      try {
+        const json = parseJson(body);
+        if (json && json.code === 0) {
+          return callback({
+            ok: true,
+            message: `🎁 成功兑换 ${planMeta.days} 天会员（消耗 ${planMeta.points} 积分）`,
+          });
+        }
+        const msg = (json && json.message) || "接口返回异常";
+        return callback({ ok: false, message: `⚠️ 兑换未成功（${msg}）` });
+      } catch (e) {
+        return callback({ ok: false, message: "⚠️ 兑换响应解析失败" });
+      }
     }
   );
 }
@@ -458,8 +529,18 @@ function checkin() {
           }
         }
 
-        writeStore(currentDate, LAST_SUCCESS_KEY);
-        checkStatus(origin, cookie, authorization, classified);
+        const storedStrategy = readStore(EXCHANGE_PLAN_KEY);
+        const exchangeStrategy = storedStrategy !== null && storedStrategy !== undefined ? storedStrategy : "max";
+        const planKey = resolveExchangePlan(exchangeStrategy, liveBalance);
+        if (planKey) {
+          executeExchange(origin, cookie, authorization, planKey, (exchangeResult) => {
+            writeStore(currentDate, LAST_SUCCESS_KEY);
+            checkStatus(origin, cookie, authorization, classified, exchangeResult && exchangeResult.message);
+          });
+        } else {
+          writeStore(currentDate, LAST_SUCCESS_KEY);
+          checkStatus(origin, cookie, authorization, classified);
+        }
       });
     }
   );

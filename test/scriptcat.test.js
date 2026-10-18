@@ -3,7 +3,8 @@ const fs = require("fs");
 const path = require("path");
 const vm = require("vm");
 
-const scriptPath = path.join(__dirname, "glados.auto-checkin.scriptcat.user.js");
+const rootDir = path.resolve(__dirname, "..");
+const scriptPath = path.join(rootDir, "glados.auto-checkin.scriptcat.user.js");
 const script = fs.readFileSync(scriptPath, "utf8");
 
 assert.deepEqual(
@@ -629,6 +630,34 @@ async function testAdditionalRemoteNotificationChannels() {
   assert.match(remote[4].data, /"group":"GLaDOS"/);
 }
 
+async function testExchangeFlow() {
+  const result = await runScript(
+    [
+      ...statusScan({
+        network: response({ code: 0, data: { email: "user@example.com", leftDays: 10 } }),
+      }),
+      response({ list: [{ change: "10.00000000", balance: "150.00000000" }] }),
+      response({ code: 0, points: "150.0000000000000000" }),
+      response({ code: 0, message: "Change point to days success" }),
+    ],
+    {
+      GM_getValue: async (key, fallback) => {
+        if (key === "glados_exchange_plan") return "plan100";
+        return fallback;
+      },
+    }
+  );
+
+  assert.equal(result.error, undefined);
+  assert.equal(result.requests.length, ORIGIN_COUNT + 3);
+  const exchangeReq = result.requests[ORIGIN_COUNT + 2];
+  assert.equal(exchangeReq.url, "https://glados.network/api/user/exchange");
+  assert.equal(exchangeReq.method, "POST");
+  assert.equal(JSON.parse(exchangeReq.data).planType, "plan100");
+  assert.match(result.notifications[0].text, /已兑\+10天/);
+  assert.match(result.value, /成功兑换 10 天会员/);
+}
+
 (async () => {
   assert.match(script, /@crontab\s+5-55\/5 \* once \* \*/);
   assert.doesNotMatch(script, /evil_gladoscookie|evil_galdosauthorization/);
@@ -680,6 +709,7 @@ async function testAdditionalRemoteNotificationChannels() {
   await testExplicitSuccessWithoutPointRecord();
   await testOptionalPushDeerNotificationDoesNotLeakCredentials();
   await testAdditionalRemoteNotificationChannels();
+  await testExchangeFlow();
   console.log("glados scriptcat tests passed");
 })().catch((error) => {
   console.error(error);

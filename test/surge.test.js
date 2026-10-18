@@ -3,7 +3,8 @@ const fs = require("fs");
 const path = require("path");
 const vm = require("vm");
 
-const scriptPath = path.join(__dirname, "glados.autosign.surge.js");
+const rootDir = path.resolve(__dirname, "..");
+const scriptPath = path.join(rootDir, "glados.autosign.surge.js");
 
 const SUPPORTED_HOSTNAMES = [
   "glados.network",
@@ -21,7 +22,7 @@ const SUPPORTED_HOSTS = ["network", "rocks", "one", "space", "cloud", "vip", "fa
 const DOMAIN_ALT = "network|rocks|one|space|cloud|vip";
 
 function testStableResourceReferencesAndNotificationBoundary() {
-  const version = require("./package.json").version;
+  const version = require("../package.json").version;
   const files = [
     "Surge/glados-auto-checkin.sgmodule",
     "QuantumultX/glados-auto-checkin.snippet",
@@ -30,7 +31,7 @@ function testStableResourceReferencesAndNotificationBoundary() {
   const stablePrefix = "https://raw.githubusercontent.com/Walvez/glados-auto-checkin/refs/heads/main/";
 
   files.forEach((file) => {
-    const content = fs.readFileSync(path.join(__dirname, file), "utf8");
+    const content = fs.readFileSync(path.join(rootDir, file), "utf8");
     const projectRawUrls = content.match(
       /https:\/\/raw\.githubusercontent\.com\/Walvez\/glados-auto-checkin\/[^\s'"`)]+/g
     ) || [];
@@ -42,7 +43,7 @@ function testStableResourceReferencesAndNotificationBoundary() {
   });
 
   const module = fs.readFileSync(
-    path.join(__dirname, "Surge/glados-auto-checkin.sgmodule"),
+    path.join(rootDir, "Surge/glados-auto-checkin.sgmodule"),
     "utf8"
   );
   assert.doesNotMatch(module, /#!arguments=|\bargument=|pushdeer|serverchan|telegram/i);
@@ -54,7 +55,7 @@ function testStableResourceReferencesAndNotificationBoundary() {
   );
 
   const scriptCat = fs.readFileSync(
-    path.join(__dirname, "glados.auto-checkin.scriptcat.user.js"),
+    path.join(rootDir, "glados.auto-checkin.scriptcat.user.js"),
     "utf8"
   );
   const scriptCatVersion = scriptCat.match(/@version\s+(\d+\.\d+\.\d+)/)?.[1];
@@ -63,11 +64,11 @@ function testStableResourceReferencesAndNotificationBoundary() {
 
 function testConfigFilesCoverAllMainDomains() {
   const module = fs.readFileSync(
-    path.join(__dirname, "Surge/glados-auto-checkin.sgmodule"),
+    path.join(rootDir, "Surge/glados-auto-checkin.sgmodule"),
     "utf8"
   );
   const snippet = fs.readFileSync(
-    path.join(__dirname, "QuantumultX/glados-auto-checkin.snippet"),
+    path.join(rootDir, "QuantumultX/glados-auto-checkin.snippet"),
     "utf8"
   );
   const proxyScript = fs.readFileSync(scriptPath, "utf8");
@@ -752,6 +753,54 @@ async function testSecondRunTodaySkipsSilently() {
   assert.equal(result.notifications.length, 0);
 }
 
+async function testSurgeExchangeFlow() {
+  const posts = [];
+  const gets = [];
+  const result = await runScript({
+    store: {
+      evil_gladoscookie: "session=test",
+      evil_gladosorigin: "https://glados.rocks",
+      glados_exchange_plan: "plan100",
+    },
+    $httpClient: {
+      post: (options, callback) => {
+        posts.push(options);
+        if (options.url.includes("/api/user/checkin")) {
+          return callback(
+            null,
+            { status: 200 },
+            JSON.stringify({ code: 0, list: [{ change: 1, balance: 160 }] })
+          );
+        }
+        if (options.url.includes("/api/user/exchange")) {
+          return callback(null, { status: 200 }, JSON.stringify({ code: 0, message: "ok" }));
+        }
+        callback(null, { status: 404 }, "not found");
+      },
+      get: (options, callback) => {
+        gets.push(options);
+        if (options.url.includes("/api/user/points")) {
+          return callback(null, { status: 200 }, JSON.stringify({ code: 0, points: 160 }));
+        }
+        if (options.url.includes("/api/user/status")) {
+          return callback(
+            null,
+            { status: 200 },
+            JSON.stringify({ code: 0, data: { email: "surge@example.com", leftDays: 20 } })
+          );
+        }
+        callback(null, { status: 404 }, "not found");
+      },
+    },
+  });
+
+  assert.equal(result.doneValue.status, "ok");
+  const exchangePost = posts.find((p) => p.url.includes("/api/user/exchange"));
+  assert.ok(exchangePost, "应发起 Surge 积分兑换请求");
+  assert.equal(JSON.parse(exchangePost.body).planType, "plan100");
+  assert.match(result.notifications[0].body, /成功兑换 10 天会员/);
+}
+
 const resultNotifications = [];
 
 (async () => {
@@ -780,6 +829,7 @@ const resultNotifications = [];
   await testHttp403NeedsCookieWithoutRetry();
   await testStatusFailureIsPartialSuccess();
   await testSecondRunTodaySkipsSilently();
+  await testSurgeExchangeFlow();
   console.log("glados surge tests passed");
 })().catch((error) => {
   console.error(error);

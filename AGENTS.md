@@ -2,7 +2,7 @@
 
 ## 项目定位
 
-多端 GLaDOS 每日签到：ScriptCat 浏览器脚本、Surge / Quantumult X 本机模块、GitHub Actions / CLI。公开仓库 `Walvez/glados-auto-checkin`；现役版本以 `package.json` 与 `main` 为准（当前 **1.7.0**）。
+多端 GLaDOS 每日签到：ScriptCat 浏览器脚本、Surge / Quantumult X 本机模块、GitHub Actions / CLI。公开仓库 `Walvez/glados-auto-checkin`；现役版本以 `package.json` 与 `main` 为准（当前 **1.8.0**）。
 
 ## 怎么跑
 
@@ -11,7 +11,7 @@ npm test
 npm run checkin   # 需 GLADOS_COOKIE；可选 GLADOS_ORIGIN
 ```
 
-ScriptCat 安装页：`https://scriptcat.org/zh-CN/script-show-page/7014`  
+ScriptCat 安装页：`https://scriptcat.org/zh-CN/script-show-page/7014`
 远程模块/脚本 URL 跟随 `main` Raw，不跟语义化 tag。
 
 ## 技术栈
@@ -28,8 +28,8 @@ ScriptCat 安装页：`https://scriptcat.org/zh-CN/script-show-page/7014`
 
 ## 红线（下次必守）
 
-1. **白名单域名**（当前 7 个，禁止 `glados.*` 通配）：  
-   `glados.network` `glados.rocks` `glados.one` `glados.space` `glados.cloud` `glados.vip` `glados-facility.com`  
+1. **白名单域名**（当前 7 个，禁止 `glados.*` 通配）：
+   `glados.network` `glados.rocks` `glados.one` `glados.space` `glados.cloud` `glados.vip` `glados-facility.com`
    新增域名须重新验证 DNS/API/资源指纹；`glados.live` 已失效、`glados.top` 为推广跳转，不进白名单。
 2. Cookie / token **同 origin**：签到 body token = 实际请求 hostname；凭据只发往捕获或 Secret 指定的域名。
 3. 版本三处一致：`package.json`、`// @version`、相关测试断言；改菜单/通知文案时同步测试。
@@ -39,6 +39,7 @@ ScriptCat 安装页：`https://scriptcat.org/zh-CN/script-show-page/7014`
 
 ## 当前状态
 
-- 代码 / 文档 / GitHub Raw / ScriptCat 1.7.0 已对齐 `glados-facility.com`；1.7.0 起镜像域名探测失败只作通知附注，不再判定整体签到失败（后端已将数字字段序列化为字符串，脚本已兼容）
+- 1.8.0 已支持多端积分自动兑换（默认 max 策略：目标 500 积分兑换 100 天最大套餐，小于 500 积分直接跳过保留；支持 plan100/plan200/plan500/auto/off，具备非幂等单次调用防护）；
+- 代码 / 文档 / GitHub Raw / ScriptCat 1.8.0 已对齐 `glados-facility.com`；1.7.0 起镜像域名探测失败只作通知附注，不再判定整体签到失败（后端已将数字字段序列化为字符串，脚本已兼容）
 - 无项目级 CLAUDE.md；本文件为 Codex/Agent 入口
 - 发布细节见 `~/.codex/memories/skills/glados-auto-checkin-release/SKILL.md`

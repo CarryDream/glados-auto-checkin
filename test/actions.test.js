@@ -5,8 +5,9 @@ const fs = require("fs");
 const path = require("path");
 const { pathToFileURL } = require("url");
 
-const core = require("./lib/glados-core");
-const checkinCli = require("./cli/checkin");
+const rootDir = path.resolve(__dirname, "..");
+const core = require("../lib/glados-core");
+const checkinCli = require("../cli/checkin");
 
 const {
   GLADOS_ORIGINS,
@@ -17,6 +18,9 @@ const {
   isSuccessfulOutcome,
   parseJsonBody,
   isAlreadyCheckedIn,
+  resolveExchangePlan,
+  normalizeExchangePlanName,
+  EXCHANGE_PLANS,
 } = core;
 
 const { runCheckin, resolveOrigins, main } = checkinCli;
@@ -466,6 +470,209 @@ async function testLoginExpiredExitOne() {
   assert.equal(outcome.results[0].kind, "error");
 }
 
+async function testResolveExchangePlan() {
+  assert.equal(resolveExchangePlan("", 150), null);
+  assert.equal(resolveExchangePlan("off", 500), null);
+  assert.equal(resolveExchangePlan("none", 500), null);
+  assert.equal(resolveExchangePlan("plan100", 99), null);
+  assert.equal(resolveExchangePlan("plan100", 100), "plan100");
+  assert.equal(resolveExchangePlan("plan100", 250), "plan100");
+  assert.equal(resolveExchangePlan("plan200", 199), null);
+  assert.equal(resolveExchangePlan("plan200", 200), "plan200");
+  assert.equal(resolveExchangePlan("auto", 80), null);
+  assert.equal(resolveExchangePlan("auto", 150), "plan100");
+  assert.equal(resolveExchangePlan("auto", 250), "plan200");
+  assert.equal(resolveExchangePlan("auto", 600), "plan500");
+  assert.equal(resolveExchangePlan("max", 550), "plan500");
+  assert.equal(resolveExchangePlan("max", 499), null); // max 策略小于 500 必须跳过
+  assert.equal(resolveExchangePlan("max", 200), null);
+  assert.equal(resolveExchangePlan(undefined, 500), "plan500"); // 默认策略为 max
+  assert.equal(resolveExchangePlan(undefined, 450), null);
+
+  assert.throws(() => normalizeExchangePlanName("invalid_plan"));
+}
+
+async function testExchangeSuccessFlow() {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push({ url, method: init.method, body: init.body, headers: init.headers });
+    if (url.includes("/api/user/status")) {
+      return jsonResponse({ code: 0, data: { email: "ex@example.com", leftDays: 10 } });
+    }
+    if (url.includes("/api/user/checkin")) {
+      return jsonResponse({ code: 0, message: "Checkin Success", list: [{ change: "1", balance: "150" }] });
+    }
+    if (url.includes("/api/user/points")) {
+      return jsonResponse({ code: 0, points: 150 });
+    }
+    if (url.includes("/api/user/exchange")) {
+      return jsonResponse({ code: 0, message: "Change point to days success" });
+    }
+    throw new Error(`Unexpected url: ${url}`);
+  };
+
+  const outcome = await runCheckin({
+    env: {
+      GLADOS_COOKIE: sampleCookie("ex1"),
+      GLADOS_EXCHANGE_PLAN: "plan100",
+    },
+    logger: createLogger(),
+    fetch: fetchImpl,
+    sleep: async () => {},
+  });
+
+  assert.equal(outcome.exitCode, 0);
+  assert.equal(outcome.ok, true);
+  const exchangeCall = calls.find((c) => c.url.includes("/api/user/exchange"));
+  assert.ok(exchangeCall, "应发起 exchange 请求");
+  assert.equal(exchangeCall.method, "POST");
+  assert.equal(JSON.parse(exchangeCall.body).planType, "plan100");
+  assert.match(outcome.results[0].message, /兑换成功/);
+}
+
+async function testExchangeInsufficientPointsSkips() {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push({ url, method: init.method });
+    if (url.includes("/api/user/status")) {
+      return jsonResponse({ code: 0, data: { email: "ex@example.com", leftDays: 10 } });
+    }
+    if (url.includes("/api/user/checkin")) {
+      return jsonResponse({ code: 0, message: "Checkin Success", list: [{ change: "1", balance: "80" }] });
+    }
+    if (url.includes("/api/user/points")) {
+      return jsonResponse({ code: 0, points: 80 });
+    }
+    throw new Error(`Unexpected url: ${url}`);
+  };
+
+  const outcome = await runCheckin({
+    env: {
+      GLADOS_COOKIE: sampleCookie("ex2"),
+      GLADOS_EXCHANGE_PLAN: "plan100",
+    },
+    logger: createLogger(),
+    fetch: fetchImpl,
+    sleep: async () => {},
+  });
+
+  assert.equal(outcome.exitCode, 0);
+  const exchangeCall = calls.find((c) => c.url.includes("/api/user/exchange"));
+  assert.equal(exchangeCall, undefined, "积分不足时不应发起 exchange 请求");
+}
+
+async function testExchangeFailureDoesNotFailCheckin() {
+  let exchangeAttempts = 0;
+  const fetchImpl = async (url, init) => {
+    if (url.includes("/api/user/status")) {
+      return jsonResponse({ code: 0, data: { email: "ex@example.com", leftDays: 10 } });
+    }
+    if (url.includes("/api/user/checkin")) {
+      return jsonResponse({ code: 0, message: "Checkin Success", list: [{ change: "1", balance: "250" }] });
+    }
+    if (url.includes("/api/user/points")) {
+      return jsonResponse({ code: 0, points: 250 });
+    }
+    if (url.includes("/api/user/exchange")) {
+      exchangeAttempts += 1;
+      return jsonResponse({ code: 500, message: "Service Unavailable" }, 500);
+    }
+    throw new Error(`Unexpected url: ${url}`);
+  };
+
+  const outcome = await runCheckin({
+    env: {
+      GLADOS_COOKIE: sampleCookie("ex3"),
+      GLADOS_EXCHANGE_PLAN: "plan200",
+    },
+    logger: createLogger(),
+    fetch: fetchImpl,
+    sleep: async () => {},
+  });
+
+  assert.equal(outcome.exitCode, 0, "兑换失败不能导致签到判定失败");
+  assert.equal(exchangeAttempts, 1, "非幂等兑换请求必须只尝试 1 次，严禁重试");
+  assert.match(outcome.results[0].message, /兑换请求异常|兑换未成功/);
+}
+
+async function testDefaultMaxExchangeFlow() {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push({ url, method: init.method, body: init.body });
+    if (url.includes("/api/user/status")) {
+      return jsonResponse({ code: 0, data: { email: "default-max@example.com", leftDays: 5 } });
+    }
+    if (url.includes("/api/user/checkin")) {
+      return jsonResponse({ code: 0, message: "Checkin Success", list: [{ change: "1", balance: "600" }] });
+    }
+    if (url.includes("/api/user/points")) {
+      return jsonResponse({ code: 0, points: 600 });
+    }
+    if (url.includes("/api/user/exchange")) {
+      return jsonResponse({ code: 0, message: "ok" });
+    }
+    throw new Error(`Unexpected url: ${url}`);
+  };
+
+  const outcome = await runCheckin({
+    env: {
+      GLADOS_COOKIE: sampleCookie("default-max"),
+      // 未显式提供 GLADOS_EXCHANGE_PLAN，应默认使用 max
+    },
+    logger: createLogger(),
+    fetch: fetchImpl,
+    sleep: async () => {},
+  });
+
+  assert.equal(outcome.exitCode, 0);
+  const exchangeCall = calls.find((c) => c.url.includes("/api/user/exchange"));
+  assert.ok(exchangeCall, "默认应使用 max 策略发起兑换");
+  assert.equal(JSON.parse(exchangeCall.body).planType, "plan500");
+}
+
+async function testAccountLevelExchangeOverride() {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push({ url, method: init.method, body: init.body });
+    if (url.includes("/api/user/status")) {
+      return jsonResponse({ code: 0, data: { email: "override@example.com", leftDays: 5 } });
+    }
+    if (url.includes("/api/user/checkin")) {
+      return jsonResponse({ code: 0, message: "Checkin Success", list: [{ change: "1", balance: "120" }] });
+    }
+    if (url.includes("/api/user/points")) {
+      return jsonResponse({ code: 0, points: 120 });
+    }
+    if (url.includes("/api/user/exchange")) {
+      return jsonResponse({ code: 0, message: "ok" });
+    }
+    throw new Error(`Unexpected url: ${url}`);
+  };
+
+  const accountsJson = JSON.stringify([
+    {
+      cookie: sampleCookie("acc-ovr"),
+      name: "custom-acc",
+      exchange: "plan100",
+    },
+  ]);
+
+  const outcome = await runCheckin({
+    env: {
+      GLADOS_COOKIE: accountsJson,
+      // 全局未配置 GLADOS_EXCHANGE_PLAN
+    },
+    logger: createLogger(),
+    fetch: fetchImpl,
+    sleep: async () => {},
+  });
+
+  assert.equal(outcome.exitCode, 0);
+  const exchangeCall = calls.find((c) => c.url.includes("/api/user/exchange"));
+  assert.ok(exchangeCall, "账号级指定的 exchange 计划应被触发");
+  assert.equal(JSON.parse(exchangeCall.body).planType, "plan100");
+}
+
 async function testMainHelp() {
   const logger = createLogger();
   const code = await main(["--help"], { logger });
@@ -476,7 +683,7 @@ async function testMainHelp() {
 // --- workflow structure checks ---
 
 function testWorkflowYamlStructure() {
-  const workflowPath = path.join(__dirname, ".github/workflows/checkin.yml");
+  const workflowPath = path.join(rootDir, ".github/workflows/checkin.yml");
   const text = fs.readFileSync(workflowPath, "utf8");
 
   assert.match(text, /^name:\s*GLaDOS Check-in/m);
@@ -499,16 +706,16 @@ function testWorkflowYamlStructure() {
 }
 
 function testPackageScriptsAndVersion() {
-  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "package.json"), "utf8"));
-  assert.equal(pkg.version, "1.7.0");
-  assert.match(pkg.scripts.test, /test-glados-actions/);
+  const pkg = JSON.parse(fs.readFileSync(path.join(rootDir, "package.json"), "utf8"));
+  assert.equal(pkg.version, "1.8.0");
+  assert.match(pkg.scripts.test, /test\/actions\.test\.js/);
   assert.match(pkg.scripts["checkin"], /cli\/checkin\.js/);
 }
 
 function testExistingScriptsUseDynamicToken() {
-  const surge = fs.readFileSync(path.join(__dirname, "glados.autosign.surge.js"), "utf8");
+  const surge = fs.readFileSync(path.join(rootDir, "glados.autosign.surge.js"), "utf8");
   const scriptcat = fs.readFileSync(
-    path.join(__dirname, "glados.auto-checkin.scriptcat.user.js"),
+    path.join(rootDir, "glados.auto-checkin.scriptcat.user.js"),
     "utf8"
   );
   assert.match(surge, /token:\s*origin\.slice\("https:\/\/"\.length\)/);
@@ -541,6 +748,12 @@ async function run() {
     ["retry on 429", testRetryOn429ThenSuccess],
     ["skip repeat within run", testSkipRepeatWithinSameRun],
     ["login expired exit 1", testLoginExpiredExitOne],
+    ["resolveExchangePlan strategies", testResolveExchangePlan],
+    ["exchange success flow", testExchangeSuccessFlow],
+    ["exchange insufficient points skips", testExchangeInsufficientPointsSkips],
+    ["exchange failure does not fail checkin", testExchangeFailureDoesNotFailCheckin],
+    ["default max exchange flow", testDefaultMaxExchangeFlow],
+    ["account level exchange override", testAccountLevelExchangeOverride],
     ["main --help", testMainHelp],
     ["workflow YAML structure", testWorkflowYamlStructure],
     ["package scripts/version", testPackageScriptsAndVersion],
@@ -560,7 +773,7 @@ async function run() {
   }
 
   // Sanity: module is loadable via file URL path style used in docs
-  assert.ok(pathToFileURL(path.join(__dirname, "cli/checkin.js")).href);
+  assert.ok(pathToFileURL(path.join(rootDir, "cli/checkin.js")).href);
 
   if (failed > 0) {
     console.error(`\n${failed} test(s) failed`);
